@@ -23,12 +23,12 @@ def calculate_top_ten_played_for_player(player_id: str, supabase_client: Client)
         int: Number of original top 10 players this player has faced
     """
     try:
-        # Get original top 10 player IDs (ranked players with highest ELO)
-        players_response = supabase_client.table("players").select("id, elo, top_ten_played").execute()
+        # Get original top 10 player IDs (ranked players with highest ELO, excluding inactive)
+        players_response = supabase_client.table("players").select("id, elo, top_ten_played, inactive").execute()
         players_data = players_response.data
-        
-        # Filter ranked players (top_ten_played >= 3) and get top 10 by ELO
-        ranked_players = [p for p in players_data if p.get('top_ten_played', 0) >= 3]
+
+        # Filter ranked players (top_ten_played >= 3) and active, then get top 10 by ELO
+        ranked_players = [p for p in players_data if p.get('top_ten_played', 0) >= 3 and not p.get('inactive', False)]
         ranked_players.sort(key=lambda x: x['elo'], reverse=True)
         original_top_ten_ids = {p['id'] for p in ranked_players[:10]}
         
