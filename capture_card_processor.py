@@ -19,6 +19,7 @@ from google.genai import types
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from r2_storage import R2StorageClient
 
 # Load environment variables from .env file
 load_dotenv()
@@ -173,7 +174,10 @@ class SmashBrosProcessor:
         
         # Store Supabase client as instance variable
         self.supabase_client = supabase_client
-        
+
+        # Initialize R2 storage client
+        self.r2_client = R2StorageClient()
+
         # Setup logging
         self.setup_logging()
     
@@ -1335,7 +1339,19 @@ keep the following in mind:
             
             # Rename files to include match ID
             self.rename_match_files(match_id)
-            
+
+            # Extract timestamp from renamed filepath for R2 upload
+            # Format after rename: {match_id}-{timestamp}.mp4
+            timestamp = None
+            if self.current_match_filepath:
+                filename = os.path.basename(self.current_match_filepath)
+                # Extract timestamp part: match_id-YYYYMMDD_HHMMSS.mp4
+                if filename.endswith('.mp4'):
+                    name_without_ext = filename[:-4]  # Remove .mp4
+                    parts = name_without_ext.split('-', 1)  # Split on first dash
+                    if len(parts) == 2:
+                        timestamp = parts[1]  # Get the timestamp part
+
             players = []
             winners = []
             
@@ -1375,7 +1391,12 @@ keep the following in mind:
                 
                 if stat.has_won:
                     winners.append(player['display_name'])
-            
+
+            # Upload match files to R2 storage
+            if timestamp:
+                participant_names = [p['name'] for p in players]
+                self.upload_match_to_r2(match_id, timestamp, participant_names)
+
             # Print match results
             print("\n" + "="*60)
             print("MATCH RESULTS")
@@ -1482,7 +1503,76 @@ keep the following in mind:
                         
         except Exception as e:
             self.logger.error(f"Error renaming match files: {e}")
-    
+
+    def upload_match_to_r2(self, match_id: int, timestamp: str, participants: Optional[List[str]] = None):
+        """
+        Upload match files to R2 and update database with URLs.
+
+        Args:
+            match_id: Database ID of the match
+            timestamp: Timestamp string for the match (format: YYYYMMDD_HHMMSS)
+            participants: Optional list of participant names
+        """
+        if not self.r2_client or not self.r2_client.enabled:
+            self.logger.debug("R2 storage not enabled, skipping upload")
+            return
+
+        urls = {}
+
+        try:
+            # Upload main match video
+            if self.current_match_filepath and os.path.exists(self.current_match_filepath):
+                self.logger.info(f"Uploading match video to R2: {self.current_match_filepath}")
+                video_url = self.r2_client.upload_match_video(
+                    self.current_match_filepath,
+                    match_id,
+                    timestamp,
+                    participants
+                )
+                if video_url:
+                    urls['video_url'] = video_url
+                    self.logger.info(f"Match video uploaded successfully: {video_url}")
+                else:
+                    self.logger.warning("Failed to upload match video to R2")
+
+            # Upload result screen video
+            if self.current_result_screen_filepath and os.path.exists(self.current_result_screen_filepath):
+                self.logger.info(f"Uploading result screen video to R2: {self.current_result_screen_filepath}")
+                result_url = self.r2_client.upload_result_screen_video(
+                    self.current_result_screen_filepath,
+                    match_id,
+                    timestamp
+                )
+                if result_url:
+                    urls['result_screen_video_url'] = result_url
+                    self.logger.info(f"Result screen video uploaded successfully: {result_url}")
+                else:
+                    self.logger.warning("Failed to upload result screen video to R2")
+
+            # Upload frame 42 image
+            if hasattr(self, 'current_frame_30_image_path') and self.current_frame_30_image_path and os.path.exists(self.current_frame_30_image_path):
+                self.logger.info(f"Uploading frame 42 image to R2: {self.current_frame_30_image_path}")
+                frame_url = self.r2_client.upload_frame_image(
+                    self.current_frame_30_image_path,
+                    match_id,
+                    timestamp,
+                    frame_number=42
+                )
+                if frame_url:
+                    urls['frame_42_image_url'] = frame_url
+                    self.logger.info(f"Frame 42 image uploaded successfully: {frame_url}")
+                else:
+                    self.logger.warning("Failed to upload frame 42 image to R2")
+
+            # Update database with R2 URLs
+            if urls and self.supabase_client:
+                self.logger.info(f"Updating match {match_id} with R2 URLs: {list(urls.keys())}")
+                self.supabase_client.table("matches").update(urls).eq("id", match_id).execute()
+                self.logger.info(f"Successfully updated match {match_id} with R2 URLs")
+
+        except Exception as e:
+            self.logger.error(f"Error uploading match files to R2: {e}")
+
     def add_metadata_to_mp4(self, filepath: str, participants: List[str]):
         """Add participant names to MP4 file metadata"""
         if not participants:
