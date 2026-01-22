@@ -64,7 +64,7 @@ def get_all_players() -> tuple[Dict[str, Dict], set]:
             })
 
         # Get original top 10: filter by ranked players (top_ten_played >= 3) and active, then sort by ELO
-        ranked_players = [p for p in original_players_with_ranking if p['top_ten_played'] >= 3 and not p.get('inactive', False)]
+        ranked_players = [p for p in original_players_with_ranking if p['top_ten_played'] >= 3 and not p['inactive']]
         original_top_ten = sorted(ranked_players, key=lambda p: p['elo'], reverse=True)[:10]
         original_top_ten_ids = {player['id'] for player in original_top_ten}
         
