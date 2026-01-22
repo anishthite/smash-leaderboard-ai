@@ -2,31 +2,34 @@
 """
 Batch Process Saved Match Videos
 
-This script processes all video files in a directory in order by filename,
-and sets the match created_at timestamp based on the file's creation date.
+This script processes full match video files, extracts the result screen portion,
+and sends it to Gemini for stats extraction. Sets match created_at timestamp
+based on the file's creation date.
 
 Usage:
     python batch_process_videos.py /path/to/videos/directory
-    python batch_process_videos.py /path/to/videos/directory --slowdown 5
+    python batch_process_videos.py /path/to/videos/directory --slowdown 10
     python batch_process_videos.py /path/to/videos/directory --dry-run
 """
 
 import argparse
+import cv2
+import numpy as np
 import os
 import sys
 import time
 import logging
+import tempfile
 from datetime import datetime
 from typing import List, Optional
 import platform
+import re
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
-import re
-import pytz
 
 from elo_utils import calculate_elo_update_for_streaming, update_inactivity_status
 
@@ -74,11 +77,8 @@ except Exception as e:
 def get_file_creation_time(filepath: str) -> datetime:
     """Get the creation time of a file, cross-platform."""
     if platform.system() == 'Windows':
-        # On Windows, st_ctime is the creation time
         timestamp = os.path.getctime(filepath)
     else:
-        # On macOS, use st_birthtime for creation time
-        # On Linux, fall back to st_mtime (modification time) as creation time isn't always available
         stat = os.stat(filepath)
         if hasattr(stat, 'st_birthtime'):
             timestamp = stat.st_birthtime
@@ -97,20 +97,32 @@ def get_video_files(directory: str) -> List[str]:
         if filename.lower().endswith(video_extensions):
             files.append(os.path.join(directory, filename))
 
-    # Sort by filename (which typically contains timestamp like 20260121_223757)
     files.sort(key=lambda x: os.path.basename(x))
     return files
 
 
 class BatchVideoProcessor:
-    def __init__(self, directory: str, slowdown_factor: int = 5, dry_run: bool = False):
+    def __init__(self, directory: str, slowdown_factor: int = 10, dry_run: bool = False):
         self.directory = directory
         self.slowdown_factor = slowdown_factor
         self.dry_run = dry_run
-        self.setup_logging()
         self.processed_count = 0
         self.skipped_count = 0
         self.failed_count = 0
+
+        # Detection parameters (from capture_card_processor.py)
+        self.game_end_confidence_threshold = 0.7
+        self.game_region_top = 0.27
+        self.game_region_bottom = 0.54
+        self.game_region_left = 0.2
+        self.game_region_right = 0.8
+
+        # Result screens output directory
+        self.result_screens_dir = os.path.join(directory, "result_screens")
+        if not os.path.exists(self.result_screens_dir):
+            os.makedirs(self.result_screens_dir)
+
+        self.setup_logging()
 
     def setup_logging(self):
         """Setup logging to file and console"""
@@ -136,79 +148,240 @@ class BatchVideoProcessor:
         self.logger.info(f"Slowdown factor: {self.slowdown_factor}")
         self.logger.info(f"Dry run: {self.dry_run}")
 
-    def get_match_stats(self, video_path: str) -> Optional[List[PlayerStats]]:
+    def detect_game_end(self, frame) -> tuple:
+        """
+        Detect game end by looking for 'GAME!' text or victory screen elements
+        (Same logic as capture_card_processor.py)
+        """
+        try:
+            h, w = frame.shape[:2]
+            game_region = frame[int(h*self.game_region_top):int(h*self.game_region_bottom),
+                               int(w*self.game_region_left):int(w*self.game_region_right)]
+
+            gray_game = cv2.cvtColor(game_region, cv2.COLOR_BGR2GRAY)
+            bright_mask = gray_game > 200
+            bright_ratio = np.sum(bright_mask) / (bright_mask.shape[0] * bright_mask.shape[1])
+
+            confidence = bright_ratio
+            return confidence, confidence >= self.game_end_confidence_threshold
+        except Exception as e:
+            self.logger.error(f"Error in detect_game_end: {e}")
+            return 0.0, False
+
+    def extract_result_screen(self, video_path: str) -> tuple:
+        """
+        Extract the result screen portion from a full match video.
+        Returns (result_screen_frames, frame_42_image, fps) or (None, None, None) on failure.
+        """
+        self.logger.info(f"Extracting result screen from: {video_path}")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            self.logger.error(f"Failed to open video: {video_path}")
+            return None, None, None
+
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        if fps <= 0:
+            fps = 30
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        self.logger.info(f"Video: {width}x{height} @ {fps}fps, {total_frames} frames")
+
+        # Store frames and their game end confidence scores
+        frames = []
+        scores = []
+        frame_42_image = None
+        frame_count = 0
+        frame_skip_interval = 2  # Store every 2nd frame
+        max_frames = 3600  # ~1 minute at 60fps
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+
+            # Capture frame 42 for player identification
+            if frame_count == 42:
+                frame_42_image = frame.copy()
+                self.logger.info("Captured frame 42 for player identification")
+
+            # Get game end confidence
+            confidence, _ = self.detect_game_end(frame)
+
+            # Store every nth frame
+            if frame_count % frame_skip_interval == 0:
+                frames.append(frame.copy())
+                scores.append(confidence)
+
+                # Limit memory usage
+                if len(frames) > max_frames:
+                    chunk_size = min(50, len(frames) // 4)
+                    frames = frames[chunk_size:]
+                    scores = scores[chunk_size:]
+
+            # Progress update every 1000 frames
+            if frame_count % 1000 == 0:
+                self.logger.info(f"Processed {frame_count}/{total_frames} frames...")
+
+        cap.release()
+
+        if not frames or not scores:
+            self.logger.warning("No frames captured from video")
+            return None, None, None
+
+        # Find the last frame with highest game end confidence above threshold
+        best_frame_index = -1
+        best_confidence = 0.0
+
+        for i in range(len(scores) - 1, -1, -1):
+            confidence = scores[i]
+            if confidence >= self.game_end_confidence_threshold and confidence > best_confidence:
+                best_confidence = confidence
+                best_frame_index = i
+                break
+
+        if best_frame_index == -1:
+            self.logger.warning("No frame found with game end confidence above threshold")
+            return None, None, None
+
+        # Extract frames from the best frame to the end
+        result_frames = frames[best_frame_index:]
+
+        if len(result_frames) < 15:  # Less than ~0.5 seconds
+            self.logger.warning(f"Result screen sequence too short ({len(result_frames)} frames)")
+            return None, None, None
+
+        self.logger.info(f"Extracted {len(result_frames)} result screen frames (confidence: {best_confidence:.3f})")
+
+        return result_frames, frame_42_image, fps
+
+    def create_result_video(self, frames: List, fps: int, source_filename: str) -> Optional[str]:
+        """Create a result screen video file and save to result_screens directory."""
+        if not frames:
+            return None
+
+        # Create filename based on source video name
+        base_name = os.path.splitext(source_filename)[0]
+        result_filename = f"{base_name}_result_screen.mp4"
+        result_path = os.path.join(self.result_screens_dir, result_filename)
+
+        height, width = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
+
+        if not out.isOpened():
+            self.logger.error("Failed to create video writer")
+            return None
+
+        for frame in frames:
+            out.write(frame)
+
+        out.release()
+        self.logger.info(f"Saved result screen video: {result_filename}")
+        return result_path
+
+    def get_match_stats(self, result_video_path: str, frame_42_path: Optional[str] = None) -> Optional[List[PlayerStats]]:
         """Extract player stats from result screen video using Gemini API"""
         if not gemini_client:
             self.logger.error("Gemini client not available")
             return None
 
-        if not os.path.exists(video_path):
-            self.logger.error(f"Video file not found: {video_path}")
-            return None
-
         try:
-            self.logger.info(f"Processing result screen video: {video_path}")
+            self.logger.info(f"Processing result screen video for Gemini...")
 
-            # First use ffmpeg to slow down the video
-            final_video_filepath = "./temp_processed_video.mp4"
-            ffmpeg_cmd = f"ffmpeg -y -an -i \"{video_path}\" -vf \"setpts={self.slowdown_factor}*PTS\" -map_metadata 0 \"{final_video_filepath}\" -loglevel quiet"
+            # Slow down the video
+            final_video_filepath = os.path.join(tempfile.gettempdir(), "temp_slowed_video.mp4")
+
+            # Get fps from the video
+            cap = cv2.VideoCapture(result_video_path)
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            if fps <= 0:
+                fps = 30
+            cap.release()
+
+            ffmpeg_cmd = f"ffmpeg -y -an -i \"{result_video_path}\" -vf \"setpts={self.slowdown_factor}*PTS\" -r {fps} -map_metadata 0 \"{final_video_filepath}\" -loglevel quiet"
 
             self.logger.info(f"Slowing down video by factor of {self.slowdown_factor}")
             if os.system(ffmpeg_cmd) != 0:
                 self.logger.error("Failed to process video with ffmpeg")
                 return None
 
-            # Upload file to Gemini
+            # Upload video file to Gemini
             self.logger.info("Uploading video to Gemini API...")
-            file = gemini_client.files.upload(file=final_video_filepath)
+            video_file = gemini_client.files.upload(file=final_video_filepath)
 
-            # Wait for file to be processed
-            self.logger.info("Waiting for video to be processed by Gemini...")
+            # Wait for video file to be processed
             while True:
-                file_info = gemini_client.files.get(name=file.name)
+                file_info = gemini_client.files.get(name=video_file.name)
                 if file_info.state == "ACTIVE":
                     break
                 time.sleep(1)
 
-            # Prepare content for Gemini
-            contents = [
-                file,
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text="""Here is a video recording of the results screen of a super smash bros ultimate match.
+            # Upload frame 42 image if available
+            image_file = None
+            if frame_42_path and os.path.exists(frame_42_path):
+                self.logger.info("Uploading frame 42 image for player identification...")
+                image_file = gemini_client.files.upload(file=frame_42_path)
+                while True:
+                    file_info = gemini_client.files.get(name=image_file.name)
+                    if file_info.state == "ACTIVE":
+                        break
+                    time.sleep(1)
+
+            # Build prompt
+            if image_file:
+                frame_note = "\n\nIMPORTANT: I've also included a frame captured at 42 frames (~1.4 seconds) into the match recording. This frame shows the character select screen or early game screen which displays player names clearly. Use this image to help identify the player names, as players often click through the result screen menu too quickly.\n"
+            else:
+                frame_note = ""
+
+            prompt_text = """Here is a video recording of the results screen of a super smash bros ultimate match.""" + frame_note + """
 
 Output the following information about the game's results as valid json following this schema (where it's a list of json objects -- one for each player in the match):
 
 ```
 [
 {
-\"is_online_match\" : boolean,
 \"smash_character\" : string,
 \"player_name\" : string,
 \"is_cpu\" : boolean,
 \"total_kos\" : int,
-\"total_falls\" : int,
+\"total_falls\" : int (positive integer, even if it shows negative),
 \"total_sds\" : int,
-\"has_won\" : boolean
+\"has_won\" : boolean,
+\"is_online_match\" : boolean,
 },
 ...
 ]
 ```
 
 keep the following in mind:
-
-- A video of the results screen is attached AS WELL as a picture of the vs screen. Use the picture of the vs screen to help you identify the players. and use the results screen video to help you identify the following:
-- the total number of KOs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"KOs\" label, then instead, the KO's are counted by counting the number of mini character icons shown under the \"KOs\" section of the character card. Otherwise just put 0.
-- total number of falls is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"Falls\" label, then instead, the falls are counted by counting the number of mini character icons shown under the \"Falls\" section of the character card. Otherwise just put 0.
-- total number of SDs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"SDs\" label, then instead, the SD's are counted by counting the number of mini character icons shown under the \"SDs\" section of the character card. Otherwise just put 0.
-- \"has_won\" denotes whether or not the character won (labeled with a gold-colored number 1 at the top right of the player card. if there is no number at all on the top right of the player card (whether 1 or 2 or 3 or 4), then the match is a \"no contest\" and has_won should be false.)
+- player names are listed BESIDE P1, P2, P3, etc and under the actual smash character name. Note, Player Names are NOT P1, P2, P3, etc. Examples of player names: habeas, shafaq, jmoon, subby, keneru, kento etc. Note: Player names are not the same as the smash character name. Zelda, Joker, Lucina, Donkey Kong are smash character names, not player names. Player names are the people playing the game.
+- the total number of KOs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"KOs\" label, then instead, the KO's are counted by counting the number of mini character icons shown under the \"KOs\" section of the character card
+- total number of falls is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"Falls\" label, then instead, the falls are counted by counting the number of mini character icons shown under the \"Falls\" section of the character card
+- total number of SDs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"SDs\" label, then instead, the SD's are counted by counting the number of mini character icons shown under the \"SDs\" section of the character card
+- \"has_won\" denotes whether or not the character won (labeled with a gold-colored number 1 at the top right of the player card. if there is no such number ranking on the top right, then the character did not win; for \"no contest\" matches, no character wins)
 - \"is_online_match\" There are likely to be 2 players in the match. If you see "onlineacc" as one of the player names, then return true, otherwise it is an offline match. If the player name is not "onlineacc" or "offlineacc", return false.
-- If is_cpu is false, then it's impossible to have only 1 player in the match. Really make sure that you have identified all the players in the match. Use the picture of the vs screen to help you identify the players.
-"""),
-                    ],
+- If all people playing the game have a player name, then is_cpu must be false. If is_cpu is false, then it's impossible to have only 1 player in the match. Really make sure that you have identified all the players in the match. is_cpu is ONLY TRUE if it says "CPU" on the player card. Otherwise, it is false.
+- If you see "mmmmm" as a player name, the player name has 5 'm's as letters. Not more not less.
+- Sometimes the rectangular player card does not show the KO's, Falls, or SD's, but instead shows "READY FOR THE NEXT BATTLE". In this case, set the player name to "unknown" (all in lowercase), with 0 for the total number of KOs, Falls, and SDs and not cpu and not online and not has_won and smash character also as "unknown".
+"""
+
+            # Build contents array
+            contents = []
+            if image_file:
+                contents.append(image_file)
+            contents.append(video_file)
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=prompt_text)],
                 ),
-            ]
+            )
 
             self.logger.info("Analyzing video with Gemini API...")
             response = gemini_client.models.generate_content(
@@ -220,8 +393,10 @@ keep the following in mind:
                 contents=contents,
             )
 
-            # Clean up uploaded file
-            gemini_client.files.delete(name=file.name)
+            # Clean up uploaded files
+            gemini_client.files.delete(name=video_file.name)
+            if image_file:
+                gemini_client.files.delete(name=image_file.name)
 
             # Clean up temporary video file
             try:
@@ -272,9 +447,7 @@ keep the following in mind:
             return None
 
         try:
-            # Convert to ISO format for database
             created_at_iso = created_at.isoformat()
-
             response = (
                 supabase_client.table("matches")
                 .insert({"created_at": created_at_iso})
@@ -292,7 +465,6 @@ keep the following in mind:
             return False
 
         try:
-            # Check if match should be skipped
             # Skip no contest matches
             match_is_no_contest = all(not stat.has_won for stat in stats)
             if match_is_no_contest:
@@ -306,15 +478,10 @@ keep the following in mind:
                 return False
 
             # Skip matches with unknown players
-            match_has_unknown_players = False
             for stat in stats:
                 if re.match(r"^Player \d+$", stat.player_name) or re.match(r"^P\d+$", stat.player_name) or re.match(r"^P \d+$", stat.player_name):
-                    match_has_unknown_players = True
-                    break
-
-            if match_has_unknown_players:
-                self.logger.warning("Match has unknown players (Player 1,2,3,etc.), skipping database save")
-                return False
+                    self.logger.warning("Match has unknown players (Player 1,2,3,etc.), skipping database save")
+                    return False
 
             # Skip online matches
             if stats[0].is_online_match:
@@ -337,20 +504,16 @@ keep the following in mind:
                     continue
 
                 # Save match participant
-                response = (
-                    supabase_client.table("match_participants")
-                    .insert({
-                        "player": player['id'],
-                        "smash_character": stat.smash_character.upper(),
-                        "is_cpu": stat.is_cpu,
-                        "total_kos": stat.total_kos,
-                        "total_falls": stat.total_falls,
-                        "total_sds": stat.total_sds,
-                        "has_won": stat.has_won,
-                        "match_id": match_id,
-                    })
-                    .execute()
-                )
+                supabase_client.table("match_participants").insert({
+                    "player": player['id'],
+                    "smash_character": stat.smash_character.upper(),
+                    "is_cpu": stat.is_cpu,
+                    "total_kos": stat.total_kos,
+                    "total_falls": stat.total_falls,
+                    "total_sds": stat.total_sds,
+                    "has_won": stat.has_won,
+                    "match_id": match_id,
+                }).execute()
 
                 players.append({
                     "id": player['id'],
@@ -391,7 +554,6 @@ keep the following in mind:
                 winner_index = 1 if players[0]['has_won'] else 2
                 winner = 'A' if winner_index == 1 else 'B'
 
-                # Use shared ELO calculation
                 new_elo_1, new_elo_2 = calculate_elo_update_for_streaming(
                     old_elo_1, old_elo_2, winner,
                     players[0]['id'], players[1]['id'],
@@ -401,7 +563,6 @@ keep the following in mind:
                 self.update_player_elo(players[0]['id'], new_elo_1)
                 self.update_player_elo(players[1]['id'], new_elo_2)
 
-                # Print ELO changes
                 elo_change_1 = new_elo_1 - old_elo_1
                 elo_change_2 = new_elo_2 - old_elo_2
 
@@ -420,7 +581,7 @@ keep the following in mind:
             return False
 
     def process_video(self, video_path: str) -> bool:
-        """Process a single video file"""
+        """Process a single full match video file"""
         filename = os.path.basename(video_path)
         self.logger.info(f"\n{'='*60}")
         self.logger.info(f"Processing: {filename}")
@@ -434,8 +595,29 @@ keep the following in mind:
             self.logger.info(f"[DRY RUN] Would process {filename} with created_at={created_at}")
             return True
 
-        # Extract match stats
-        match_stats = self.get_match_stats(video_path)
+        # Extract result screen from the full match video
+        result_frames, frame_42_image, fps = self.extract_result_screen(video_path)
+
+        if result_frames is None:
+            self.logger.error(f"Failed to extract result screen from {filename}")
+            return False
+
+        # Create result screen video (saved to result_screens directory)
+        result_video_path = self.create_result_video(result_frames, fps, filename)
+        if result_video_path is None:
+            self.logger.error(f"Failed to create result video for {filename}")
+            return False
+
+        # Save frame 42 image to result_screens directory if available
+        frame_42_path = None
+        if frame_42_image is not None:
+            base_name = os.path.splitext(filename)[0]
+            frame_42_path = os.path.join(self.result_screens_dir, f"{base_name}_frame_42.png")
+            cv2.imwrite(frame_42_path, frame_42_image)
+            self.logger.info(f"Saved frame 42 image: {base_name}_frame_42.png")
+
+        # Extract match stats using Gemini
+        match_stats = self.get_match_stats(result_video_path, frame_42_path)
 
         if not match_stats:
             self.logger.error(f"Failed to extract match stats from {filename}")
@@ -484,14 +666,14 @@ keep the following in mind:
         self.logger.info("=" * 60)
         self.logger.info(f"Total videos: {len(video_files)}")
         self.logger.info(f"Successfully processed: {self.processed_count}")
-        self.logger.info(f"Skipped (no contest/CPU/unknown/online): {self.skipped_count}")
+        self.logger.info(f"Skipped (no contest/CPU/unknown/online/no result screen): {self.skipped_count}")
         self.logger.info(f"Failed: {self.failed_count}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Batch process Smash Bros result screen videos')
+    parser = argparse.ArgumentParser(description='Batch process full Smash Bros match videos')
     parser.add_argument('directory', type=str, help='Path to directory containing video files')
-    parser.add_argument('--slowdown', type=int, default=5, help='Video slowdown factor (default: 5)')
+    parser.add_argument('--slowdown', type=int, default=10, help='Video slowdown factor for Gemini (default: 10)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be processed without actually processing')
 
     args = parser.parse_args()
@@ -500,7 +682,6 @@ def main():
         print(f"Error: Directory not found: {args.directory}")
         sys.exit(1)
 
-    # Create processor and run
     processor = BatchVideoProcessor(args.directory, args.slowdown, args.dry_run)
     processor.process_all()
 
