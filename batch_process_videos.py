@@ -503,7 +503,7 @@ keep the following in mind:
                 if player is None:
                     continue
 
-                # Save match participant
+                # Save match participant with same created_at as match
                 supabase_client.table("match_participants").insert({
                     "player": player['id'],
                     "smash_character": stat.smash_character.upper(),
@@ -513,6 +513,7 @@ keep the following in mind:
                     "total_sds": stat.total_sds,
                     "has_won": stat.has_won,
                     "match_id": match_id,
+                    "created_at": created_at.isoformat(),
                 }).execute()
 
                 players.append({
