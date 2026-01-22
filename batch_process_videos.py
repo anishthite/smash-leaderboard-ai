@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""
+Batch Process Saved Match Videos
+
+This script processes all video files in a directory in order by filename,
+and sets the match created_at timestamp based on the file's creation date.
+
+Usage:
+    python batch_process_videos.py /path/to/videos/directory
+    python batch_process_videos.py /path/to/videos/directory --slowdown 5
+    python batch_process_videos.py /path/to/videos/directory --dry-run
+"""
+
+import argparse
+import os
+import sys
+import time
+import logging
+from datetime import datetime
+from typing import List, Optional
+import platform
+
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from supabase import create_client, Client
+from dotenv import load_dotenv
+import re
+import pytz
+
+from elo_utils import calculate_elo_update_for_streaming, update_inactivity_status
+
+# Load environment variables
+load_dotenv()
+
+
+class PlayerStats(BaseModel):
+    is_online_match: bool
+    smash_character: str
+    player_name: str
+    is_cpu: bool
+    total_kos: int
+    total_falls: int
+    total_sds: int
+    has_won: bool
+
+
+# Initialize Gemini client
+try:
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise ValueError("GEMINI_API_KEY not found in environment variables")
+
+    gemini_client = genai.Client(api_key=gemini_api_key)
+    gemini_model = "gemini-3-pro-preview"
+except Exception as e:
+    print(f"Warning: Failed to initialize Gemini client: {e}")
+    gemini_client = None
+
+# Initialize Supabase client
+try:
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not supabase_url or not supabase_key:
+        raise ValueError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables")
+
+    supabase_client: Client = create_client(supabase_url, supabase_key)
+except Exception as e:
+    print(f"Warning: Failed to initialize Supabase client: {e}")
+    supabase_client = None
+
+
+def get_file_creation_time(filepath: str) -> datetime:
+    """Get the creation time of a file, cross-platform."""
+    if platform.system() == 'Windows':
+        # On Windows, st_ctime is the creation time
+        timestamp = os.path.getctime(filepath)
+    else:
+        # On macOS, use st_birthtime for creation time
+        # On Linux, fall back to st_mtime (modification time) as creation time isn't always available
+        stat = os.stat(filepath)
+        if hasattr(stat, 'st_birthtime'):
+            timestamp = stat.st_birthtime
+        else:
+            timestamp = stat.st_mtime
+
+    return datetime.fromtimestamp(timestamp)
+
+
+def get_video_files(directory: str) -> List[str]:
+    """Get all video files in a directory, sorted by filename."""
+    video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
+
+    files = []
+    for filename in os.listdir(directory):
+        if filename.lower().endswith(video_extensions):
+            files.append(os.path.join(directory, filename))
+
+    # Sort by filename (which typically contains timestamp like 20260121_223757)
+    files.sort(key=lambda x: os.path.basename(x))
+    return files
+
+
+class BatchVideoProcessor:
+    def __init__(self, directory: str, slowdown_factor: int = 5, dry_run: bool = False):
+        self.directory = directory
+        self.slowdown_factor = slowdown_factor
+        self.dry_run = dry_run
+        self.setup_logging()
+        self.processed_count = 0
+        self.skipped_count = 0
+        self.failed_count = 0
+
+    def setup_logging(self):
+        """Setup logging to file and console"""
+        log_filename = "batch_processor.log"
+        log_filepath = os.path.join(self.directory, log_filename)
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filepath, mode='w'),
+                logging.StreamHandler()
+            ],
+            force=True
+        )
+
+        logging.getLogger('google.auth.transport.requests').setLevel(logging.WARNING)
+        logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Batch Video Processor started")
+        self.logger.info(f"Processing directory: {self.directory}")
+        self.logger.info(f"Slowdown factor: {self.slowdown_factor}")
+        self.logger.info(f"Dry run: {self.dry_run}")
+
+    def get_match_stats(self, video_path: str) -> Optional[List[PlayerStats]]:
+        """Extract player stats from result screen video using Gemini API"""
+        if not gemini_client:
+            self.logger.error("Gemini client not available")
+            return None
+
+        if not os.path.exists(video_path):
+            self.logger.error(f"Video file not found: {video_path}")
+            return None
+
+        try:
+            self.logger.info(f"Processing result screen video: {video_path}")
+
+            # First use ffmpeg to slow down the video
+            final_video_filepath = "./temp_processed_video.mp4"
+            ffmpeg_cmd = f"ffmpeg -y -an -i \"{video_path}\" -vf \"setpts={self.slowdown_factor}*PTS\" -map_metadata 0 \"{final_video_filepath}\" -loglevel quiet"
+
+            self.logger.info(f"Slowing down video by factor of {self.slowdown_factor}")
+            if os.system(ffmpeg_cmd) != 0:
+                self.logger.error("Failed to process video with ffmpeg")
+                return None
+
+            # Upload file to Gemini
+            self.logger.info("Uploading video to Gemini API...")
+            file = gemini_client.files.upload(file=final_video_filepath)
+
+            # Wait for file to be processed
+            self.logger.info("Waiting for video to be processed by Gemini...")
+            while True:
+                file_info = gemini_client.files.get(name=file.name)
+                if file_info.state == "ACTIVE":
+                    break
+                time.sleep(1)
+
+            # Prepare content for Gemini
+            contents = [
+                file,
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(text="""Here is a video recording of the results screen of a super smash bros ultimate match.
+
+Output the following information about the game's results as valid json following this schema (where it's a list of json objects -- one for each player in the match):
+
+```
+[
+{
+\"is_online_match\" : boolean,
+\"smash_character\" : string,
+\"player_name\" : string,
+\"is_cpu\" : boolean,
+\"total_kos\" : int,
+\"total_falls\" : int,
+\"total_sds\" : int,
+\"has_won\" : boolean
+},
+...
+]
+```
+
+keep the following in mind:
+
+- A video of the results screen is attached AS WELL as a picture of the vs screen. Use the picture of the vs screen to help you identify the players. and use the results screen video to help you identify the following:
+- the total number of KOs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"KOs\" label, then instead, the KO's are counted by counting the number of mini character icons shown under the \"KOs\" section of the character card. Otherwise just put 0.
+- total number of falls is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"Falls\" label, then instead, the falls are counted by counting the number of mini character icons shown under the \"Falls\" section of the character card. Otherwise just put 0.
+- total number of SDs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"SDs\" label, then instead, the SD's are counted by counting the number of mini character icons shown under the \"SDs\" section of the character card. Otherwise just put 0.
+- \"has_won\" denotes whether or not the character won (labeled with a gold-colored number 1 at the top right of the player card. if there is no number at all on the top right of the player card (whether 1 or 2 or 3 or 4), then the match is a \"no contest\" and has_won should be false.)
+- \"is_online_match\" There are likely to be 2 players in the match. If you see "onlineacc" as one of the player names, then return true, otherwise it is an offline match. If the player name is not "onlineacc" or "offlineacc", return false.
+- If is_cpu is false, then it's impossible to have only 1 player in the match. Really make sure that you have identified all the players in the match. Use the picture of the vs screen to help you identify the players.
+"""),
+                    ],
+                ),
+            ]
+
+            self.logger.info("Analyzing video with Gemini API...")
+            response = gemini_client.models.generate_content(
+                model=gemini_model,
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    response_schema=list[PlayerStats],
+                ),
+                contents=contents,
+            )
+
+            # Clean up uploaded file
+            gemini_client.files.delete(name=file.name)
+
+            # Clean up temporary video file
+            try:
+                os.remove(final_video_filepath)
+            except:
+                pass
+
+            self.logger.info(f"Successfully extracted stats for {len(response.parsed)} players")
+
+            for i, stat in enumerate(response.parsed):
+                self.logger.info(f"Player {i+1}: {stat.player_name} ({stat.smash_character}) - KOs: {stat.total_kos}, Falls: {stat.total_falls}, SDs: {stat.total_sds}, Won: {stat.has_won}")
+
+            return response.parsed
+
+        except Exception as e:
+            self.logger.error(f"Error extracting match stats: {e}")
+            return None
+
+    def get_player(self, player_name: str) -> Optional[dict]:
+        """Get or create a player in the database"""
+        if not supabase_client:
+            return None
+
+        try:
+            response = (
+                supabase_client.table("players")
+                .upsert({"display_name": player_name}, on_conflict="display_name")
+                .execute()
+            )
+            return response.data[0]
+        except Exception as e:
+            self.logger.error(f"Error getting/creating player {player_name}: {e}")
+            return None
+
+    def update_player_elo(self, player_id: str, elo: int):
+        """Update a player's ELO in the database"""
+        if not supabase_client:
+            return
+
+        try:
+            supabase_client.table("players").update({"elo": elo}).eq("id", player_id).execute()
+        except Exception as e:
+            self.logger.error(f"Error updating player ELO: {e}")
+
+    def create_match(self, created_at: datetime) -> Optional[int]:
+        """Create a new match in the database with specified creation time"""
+        if not supabase_client:
+            return None
+
+        try:
+            # Convert to ISO format for database
+            created_at_iso = created_at.isoformat()
+
+            response = (
+                supabase_client.table("matches")
+                .insert({"created_at": created_at_iso})
+                .execute()
+            )
+            return response.data[0]['id']
+        except Exception as e:
+            self.logger.error(f"Error creating match: {e}")
+            return None
+
+    def save_match_stats(self, stats: List[PlayerStats], created_at: datetime) -> bool:
+        """Save match stats to the database with specified creation time"""
+        if not supabase_client:
+            self.logger.error("Supabase client not available")
+            return False
+
+        try:
+            # Check if match should be skipped
+            # Skip no contest matches
+            match_is_no_contest = all(not stat.has_won for stat in stats)
+            if match_is_no_contest:
+                self.logger.warning("Match is a no contest, skipping database save")
+                return False
+
+            # Skip matches with CPU players
+            match_has_cpu = any(stat.is_cpu for stat in stats)
+            if match_has_cpu:
+                self.logger.warning("Match has CPU players, skipping database save")
+                return False
+
+            # Skip matches with unknown players
+            match_has_unknown_players = False
+            for stat in stats:
+                if re.match(r"^Player \d+$", stat.player_name) or re.match(r"^P\d+$", stat.player_name) or re.match(r"^P \d+$", stat.player_name):
+                    match_has_unknown_players = True
+                    break
+
+            if match_has_unknown_players:
+                self.logger.warning("Match has unknown players (Player 1,2,3,etc.), skipping database save")
+                return False
+
+            # Skip online matches
+            if stats[0].is_online_match:
+                self.logger.warning("Match is online, skipping database save")
+                return False
+
+            # Create match with the file's creation date
+            match_id = self.create_match(created_at)
+            if match_id is None:
+                return False
+
+            players = []
+            winners = []
+
+            self.logger.info(f"Saving match stats to database (Match ID: {match_id}, Created: {created_at})")
+
+            for stat in stats:
+                player = self.get_player(stat.player_name)
+                if player is None:
+                    continue
+
+                # Save match participant
+                response = (
+                    supabase_client.table("match_participants")
+                    .insert({
+                        "player": player['id'],
+                        "smash_character": stat.smash_character.upper(),
+                        "is_cpu": stat.is_cpu,
+                        "total_kos": stat.total_kos,
+                        "total_falls": stat.total_falls,
+                        "total_sds": stat.total_sds,
+                        "has_won": stat.has_won,
+                        "match_id": match_id,
+                    })
+                    .execute()
+                )
+
+                players.append({
+                    "id": player['id'],
+                    "elo": player['elo'],
+                    "name": player['display_name'],
+                    "character": stat.smash_character,
+                    "has_won": stat.has_won,
+                    "kos": stat.total_kos,
+                    "falls": stat.total_falls,
+                    "sds": stat.total_sds
+                })
+
+                if stat.has_won:
+                    winners.append(player['display_name'])
+
+            # Print match results
+            self.logger.info("=" * 60)
+            self.logger.info("MATCH RESULTS")
+            self.logger.info("=" * 60)
+
+            if winners:
+                self.logger.info(f"Winner(s): {', '.join(winners)}")
+            else:
+                self.logger.info("No Contest")
+
+            self.logger.info("Player Stats:")
+            for player in players:
+                status = "WINNER" if player['has_won'] else ""
+                self.logger.info(f"  {player['name']} ({player['character']}) - KOs: {player['kos']}, Falls: {player['falls']}, SDs: {player['sds']} {status}")
+
+            # Update ELO ratings for 1v1 matches
+            if len(stats) == 2:
+                self.logger.info("1v1 Match detected - Updating ELO ratings:")
+
+                old_elo_1 = players[0]['elo']
+                old_elo_2 = players[1]['elo']
+
+                winner_index = 1 if players[0]['has_won'] else 2
+                winner = 'A' if winner_index == 1 else 'B'
+
+                # Use shared ELO calculation
+                new_elo_1, new_elo_2 = calculate_elo_update_for_streaming(
+                    old_elo_1, old_elo_2, winner,
+                    players[0]['id'], players[1]['id'],
+                    supabase_client
+                )
+
+                self.update_player_elo(players[0]['id'], new_elo_1)
+                self.update_player_elo(players[1]['id'], new_elo_2)
+
+                # Print ELO changes
+                elo_change_1 = new_elo_1 - old_elo_1
+                elo_change_2 = new_elo_2 - old_elo_2
+
+                self.logger.info(f"  {players[0]['name']}: {old_elo_1} -> {new_elo_1} ({elo_change_1:+d})")
+                self.logger.info(f"  {players[1]['name']}: {old_elo_2} -> {new_elo_2} ({elo_change_2:+d})")
+
+            # Update inactivity status for all players
+            self.logger.info("Updating inactivity status...")
+            update_inactivity_status(supabase_client)
+
+            self.logger.info("=" * 60)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error saving match stats: {e}")
+            return False
+
+    def process_video(self, video_path: str) -> bool:
+        """Process a single video file"""
+        filename = os.path.basename(video_path)
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"Processing: {filename}")
+        self.logger.info(f"{'='*60}")
+
+        # Get file creation time
+        created_at = get_file_creation_time(video_path)
+        self.logger.info(f"File creation time: {created_at}")
+
+        if self.dry_run:
+            self.logger.info(f"[DRY RUN] Would process {filename} with created_at={created_at}")
+            return True
+
+        # Extract match stats
+        match_stats = self.get_match_stats(video_path)
+
+        if not match_stats:
+            self.logger.error(f"Failed to extract match stats from {filename}")
+            return False
+
+        # Save to database with the file's creation time
+        success = self.save_match_stats(match_stats, created_at)
+
+        if success:
+            self.logger.info(f"Successfully processed and saved: {filename}")
+        else:
+            self.logger.warning(f"Match results extracted but not saved to database: {filename}")
+
+        return success
+
+    def process_all(self):
+        """Process all videos in the directory"""
+        video_files = get_video_files(self.directory)
+
+        if not video_files:
+            self.logger.error(f"No video files found in {self.directory}")
+            return
+
+        self.logger.info(f"Found {len(video_files)} video files to process")
+
+        for i, video_path in enumerate(video_files, 1):
+            self.logger.info(f"\n[{i}/{len(video_files)}] Processing...")
+
+            try:
+                success = self.process_video(video_path)
+                if success:
+                    self.processed_count += 1
+                else:
+                    self.skipped_count += 1
+            except Exception as e:
+                self.logger.error(f"Error processing {video_path}: {e}")
+                self.failed_count += 1
+
+            # Small delay between API calls to avoid rate limiting
+            if not self.dry_run and i < len(video_files):
+                time.sleep(2)
+
+        # Print summary
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("BATCH PROCESSING COMPLETE")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Total videos: {len(video_files)}")
+        self.logger.info(f"Successfully processed: {self.processed_count}")
+        self.logger.info(f"Skipped (no contest/CPU/unknown/online): {self.skipped_count}")
+        self.logger.info(f"Failed: {self.failed_count}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Batch process Smash Bros result screen videos')
+    parser.add_argument('directory', type=str, help='Path to directory containing video files')
+    parser.add_argument('--slowdown', type=int, default=5, help='Video slowdown factor (default: 5)')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be processed without actually processing')
+
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.directory):
+        print(f"Error: Directory not found: {args.directory}")
+        sys.exit(1)
+
+    # Create processor and run
+    processor = BatchVideoProcessor(args.directory, args.slowdown, args.dry_run)
+    processor.process_all()
+
+
+if __name__ == "__main__":
+    main()
