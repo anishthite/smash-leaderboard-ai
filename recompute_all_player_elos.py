@@ -59,11 +59,12 @@ def get_all_players() -> tuple[Dict[str, Dict], set]:
             original_players_with_ranking.append({
                 'id': player['id'],
                 'elo': player.get('elo', 1200),  # Original ELO from database
-                'top_ten_played': player.get('top_ten_played', 0)  # Original ranking status
+                'top_ten_played': player.get('top_ten_played', 0),  # Original ranking status
+                'inactive': player.get('inactive', False)
             })
-        
-        # Get original top 10: first filter by ranked players (top_ten_played >= 3), then sort by ELO
-        ranked_players = [p for p in original_players_with_ranking if p['top_ten_played'] >= 3]
+
+        # Get original top 10: filter by ranked players (top_ten_played >= 3) and active, then sort by ELO
+        ranked_players = [p for p in original_players_with_ranking if p['top_ten_played'] >= 3 and not p['inactive']]
         original_top_ten = sorted(ranked_players, key=lambda p: p['elo'], reverse=True)[:10]
         original_top_ten_ids = {player['id'] for player in original_top_ten}
         
@@ -230,14 +231,14 @@ def get_match_participants(match_id: int) -> List[Dict]:
         return []
 
 def get_original_top_ten_pandas(players_df: pd.DataFrame) -> set:
-    """Get original top 10 player IDs based on database ELOs"""
-    # Filter ranked players (top_ten_played >= 3)
-    ranked_players = players_df[players_df['top_ten_played'] >= 3].copy()
-    
+    """Get original top 10 player IDs based on database ELOs (excluding inactive players)"""
+    # Filter ranked players (top_ten_played >= 3) and active
+    ranked_players = players_df[(players_df['top_ten_played'] >= 3) & (~players_df['inactive'].fillna(False))].copy()
+
     # Sort by ELO and take top 10
     original_top_ten = ranked_players.nlargest(10, 'elo')
     original_top_ten_ids = set(original_top_ten['id'].tolist())
-    
+
     return original_top_ten_ids
 
 def calculate_top_ten_played_pandas(matches_df: pd.DataFrame, participants_df: pd.DataFrame, 
@@ -401,9 +402,10 @@ def recompute_all_player_elos_old_method():
             'elo': player.get('elo', 1200),
             'top_ten_played': player.get('top_ten_played', 0)
         })
-    
+
     # Get original top 10
     ranked_players = [p for p in original_players_with_ranking if p['top_ten_played'] >= 3]
+
     original_top_ten = sorted(ranked_players, key=lambda p: p['elo'], reverse=True)[:10]
     original_top_ten_ids = {player['id'] for player in original_top_ten}
     
